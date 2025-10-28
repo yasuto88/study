@@ -1,0 +1,21 @@
+# docker-compose.yml
+services:
+  realsense:
+    image: realsense-dev:latest
+    build:
+      context: .
+      dockerfile: Dockerfile
+      # BuildKit キャッシュを使いたい場合は make 側で付けます
+    container_name: realsense-dev
+    working_dir: /app
+    tty: true
+    stdin_open: true
+    # 開発時はコードをマウント（ホットリロード用）
+    volumes:
+      - ./:/app
+    # RealSense をコンテナへ渡す
+    devices:
+      - /dev/bus/usb:/dev/bus/usb
+    # 必要に応じて環境変数
+    environment:
+      - PYTHONUNBUFFERED=1
