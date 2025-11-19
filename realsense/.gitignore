@@ -1,5 +1,6 @@
 # Ignore local python virtual environments
 rsenv311/
+.venv/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/
