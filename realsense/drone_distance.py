@@ -1,29 +1,32 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
-from collections import deque
 from dataclasses import dataclass
+import pyrealsense2 as rs
+import time
+import sys
+import requests
+
 
 # =========================
 # 設定
 # =========================
 MODEL_PATH = "yolo11n_drone.pt"  # 学習済みドローン検出モデル
-CAM_ID = 0  # カメラID
 CONF_THRES = 0.25
 IOU_THRES = 0.45
 DETECT_INTERVAL = 10  # YOLO再検出の間隔 (大→軽い/遅延減, 小→頑丈/重い)
-MOTION_MIN_AREA = 300  # 動体マスクの最小面積
-EMA_ALPHA = 0.35  # 位置の平滑化強さ
-REACQUIRE_MAX_FRAMES = 30  # トラッカーロスト後の再取得猶予
-SHOW_EVERY = 1  # 何フレームに1回描画するか（間引き）
-ROI_MARGIN = 10  # ROIの外側に足すマージン（ピクセル）
+DEPTH_KERNEL = 5      # 中心周りの深度を平均するサイズ（奇数）
 
-# =========================
-# ちょい高速化（OpenCV）
-# =========================
+# StampFly コントローラ側 HTTP 設定
+CTRL_HOST = "192.168.4.1"
+CTRL_PORT = 80
+RANGE_ENDPOINT = f"http://{CTRL_HOST}:{CTRL_PORT}/range"
+
+SEND_INTERVAL_SEC = 0.05  # 何秒ごとに距離を送るか（20Hz）
+
+# OpenCV ちょい高速化
 cv2.setUseOptimized(True)
 try:
-    # Ultralytics側で0にする想定だが、環境で未実装なことがあるのでtry
     cv2.setNumThreads(0)
 except Exception:
     pass
@@ -41,16 +44,8 @@ class BBox:
     conf: float
 
 
-def iou(a: BBox, b: BBox) -> float:
-    xx1, yy1 = max(a.x1, b.x1), max(a.y1, b.y1)
-    xx2, yy2 = min(a.x2, b.x2), min(a.y2, b.y2)
-    w, h = max(0, xx2 - xx1), max(0, yy2 - yy1)
-    inter = w * h
-    area = (a.x2 - a.x1) * (a.y2 - a.y1) + (b.x2 - b.x1) * (b.y2 - b.y1) - inter
-    return inter / area if area > 0 else 0.0
-
-
-def ema(prev, new, alpha=EMA_ALPHA):
+def ema(prev, new, alpha=0.35):
+    """2D点の指数移動平均"""
     if prev is None:
         return new
     return (
@@ -70,197 +65,202 @@ def create_tracker():
     if hasattr(cv2, "legacy") and hasattr(cv2.legacy, "TrackerMOSSE_create"):
         return cv2.legacy.TrackerMOSSE_create()
     raise RuntimeError(
-        "OpenCVにCSRT/KCF/MOSSEトラッカーが見つかりません。opencv-contrib-python を確認してください。"
+        "OpenCVにCSRT/KCF/MOSSEトラッカーが見つかりません。"
+        "opencv-contrib-python を確認してください。"
     )
 
 
+# 距離送信ヘルパ
+_last_send_time = 0.0
+
+
+def send_range_to_drone(dist_m: float):
+    """RealSenseで計算した距離[m]を StampFly コントローラへ送信"""
+    global _last_send_time
+
+    now = time.time()
+    if now - _last_send_time < SEND_INTERVAL_SEC:
+        return  # 送りすぎ防止
+
+    _last_send_time = now
+
+    try:
+        requests.get(
+            RANGE_ENDPOINT,
+            params={"m": f"{dist_m:.3f}"},
+            timeout=0.05,
+        )
+    except Exception as e:
+        # 通信が切れていても計測自体は続けたいので、警告だけにする
+        print(f"[WARN] send_range_to_drone failed: {e}", file=sys.stderr)
+
+
 # =========================
-# モデル/カメラ 初期化
+# RealSense 初期化
+# =========================
+pipeline = rs.pipeline()
+config = rs.config()
+
+# depth / color を 30fps で取得（解像度はデフォルト）
+config.enable_stream(rs.stream.depth, rs.format.z16, 30)
+config.enable_stream(rs.stream.color, rs.format.bgr8, 30)
+
+try:
+    profile = pipeline.start(config)
+except Exception as e:
+    print("[ERROR] RealSense pipeline.start で失敗しました:", e)
+    raise
+
+align_to = rs.stream.color
+align = rs.align(align_to)
+
+depth_sensor = profile.get_device().first_depth_sensor()
+depth_scale = depth_sensor.get_depth_scale()  # 通常 0.001[m]
+print(f"[INFO] depth_scale: {depth_scale} m/unit")
+
+
+# =========================
+# モデル 初期化
 # =========================
 model = YOLO(MODEL_PATH)
-# Conv+BN融合でちょい加速
 try:
     model.fuse()
 except Exception:
     pass
 
-# WindowsならDirectShow指定のほうが遅延が少ないことが多い
-cap = cv2.VideoCapture(CAM_ID, cv2.CAP_DSHOW)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-cap.set(cv2.CAP_PROP_FPS, 30)
-# 古いフレームを溜めない
-cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
-# 背景差分（固定背景を想定）
-bg = cv2.createBackgroundSubtractorMOG2(
-    history=300, varThreshold=16, detectShadows=False
-)
-
+# =========================
+# メインループ
+# =========================
 tracker = None
 track_ok = False
-track_box = None  # (x, y, w, h)
-smoothed_c = None
-last_detect_box = None
-frames_since_detect = 0
-lost_count = 0
+last_detect_box = None  # BBox
+smoothed_c = None       # (x, y)
 frame_idx = 0
+dist_smooth = None      # 距離のEMA用
 
-trail = deque(maxlen=50)  # 可視化用の軌跡
+try:
+    while True:
+        frames = pipeline.poll_for_frames()
+        if not frames:
+            continue
 
-while True:
-    # ループで古いフレームを捨てる（grabで進め、最新だけretrieve）
-    for _ in range(2):
-        cap.grab()
-    ok, frame = cap.retrieve()
-    if not ok:
-        break
+        aligned_frames = align.process(frames)
+        depth_frame = aligned_frames.get_depth_frame()
+        color_frame = aligned_frames.get_color_frame()
+        if not depth_frame or not color_frame:
+            continue
 
-    h, w = frame.shape[:2]
+        frame = np.asanyarray(color_frame.get_data())
+        h, w = frame.shape[:2]
 
-    # --- 動きマスク ---
-    fg = bg.apply(frame)
-    fg = cv2.medianBlur(fg, 5)
-    _, fg = cv2.threshold(fg, 200, 255, cv2.THRESH_BINARY)
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    fg = cv2.morphologyEx(fg, cv2.MORPH_OPEN, kernel, iterations=1)
-    motion_mask = fg
+        # --- 一定間隔で YOLO 再検出 ---
+        do_detect = (frame_idx % DETECT_INTERVAL == 0) or (not track_ok)
+        det_box = None
 
-    # --- ROIを決定（動体領域の外接矩形） ---
-    contours, _ = cv2.findContours(
-        motion_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
-    )
-    roi_rect = None
-    if contours:
-        c = max(contours, key=cv2.contourArea)
-        if cv2.contourArea(c) >= MOTION_MIN_AREA:
-            rx, ry, rw, rh = cv2.boundingRect(c)
-            x0 = max(0, rx - ROI_MARGIN)
-            y0 = max(0, ry - ROI_MARGIN)
-            x1 = min(w, rx + rw + ROI_MARGIN)
-            y1 = min(h, ry + rh + ROI_MARGIN)
-            roi_rect = (x0, y0, x1, y1)
-
-    # --- 一定間隔で再検出 ---
-    do_detect = (frames_since_detect % DETECT_INTERVAL == 0) or (not track_ok)
-    det_box = None
-
-    if do_detect:
-        # ROIがあればそこだけ推論（高速化＆遅延低減）
-        if roi_rect is not None:
-            x0, y0, x1, y1 = roi_rect
-            roi = frame[y0:y1, x0:x1]
-            results = model.predict(
-                source=roi, conf=CONF_THRES, iou=IOU_THRES, verbose=False
-            )[0]
-            offset = (x0, y0)
-        else:
+        if do_detect:
             results = model.predict(
                 source=frame, conf=CONF_THRES, iou=IOU_THRES, verbose=False
             )[0]
-            offset = (0, 0)
 
-        candidates = []
-        if results.boxes is not None and len(results.boxes) > 0:
-            xyxys = results.boxes.xyxy.cpu().numpy()
-            confs = results.boxes.conf.cpu().numpy()
-            clss = results.boxes.cls.cpu().numpy()
-            for xyxy, conf, cls in zip(xyxys, confs, clss):
-                x1p, y1p, x2p, y2p = map(int, xyxy)
-                # ROIを使った場合は座標を元画像へオフセット
-                x1g = x1p + offset[0]
-                y1g = y1p + offset[1]
-                x2g = x2p + offset[0]
-                y2g = y2p + offset[1]
+            candidates = []
+            if results.boxes is not None and len(results.boxes) > 0:
+                xyxys = results.boxes.xyxy.cpu().numpy()
+                confs = results.boxes.conf.cpu().numpy()
+                for xyxy, conf in zip(xyxys, confs):
+                    x1p, y1p, x2p, y2p = map(int, xyxy)
+                    candidates.append(
+                        BBox(x1p, y1p, x2p, y2p, float(conf))
+                    )
 
-                cx, cy = (x1g + x2g) // 2, (y1g + y2g) // 2
-                if 0 <= cx < w and 0 <= cy < h and motion_mask[cy, cx] > 0:
-                    patch = motion_mask[
-                        max(0, y1g) : min(h, y2g), max(0, x1g) : min(w, x2g)
-                    ]
-                    area = int(patch.sum() / 255)
-                    if area >= MOTION_MIN_AREA:
-                        candidates.append(BBox(x1g, y1g, x2g, y2g, float(conf)))
-
-        if candidates:
-            if last_detect_box is None:
+            if candidates:
+                # ここでは単純に conf 最大の箱を採用
                 det_box = max(candidates, key=lambda b: b.conf)
+
+        # --- 検出があればトラッカー更新 ---
+        if det_box is not None:
+            last_detect_box = det_box
+            x, y, x2, y2 = det_box.x1, det_box.y1, det_box.x2, det_box.y2
+            w0, h0 = x2 - x, y2 - y
+            tracker = create_tracker()
+            track_ok = tracker.init(frame, (x, y, w0, h0))
+
+        # --- 検出が無くても追跡継続 ---
+        current_dist = None
+        if tracker is not None:
+            ok, box = tracker.update(frame)
+            track_ok = ok
+            if ok:
+                x, y, w0, h0 = map(int, box)
+                cx, cy = x + w0 // 2, y + h0 // 2
+                smoothed_c = ema(smoothed_c, (cx, cy))
+
+                # ==== 距離計算 ====
+                if smoothed_c is not None:
+                    sx, sy = smoothed_c
+                    sx = int(np.clip(sx, 0, w - 1))
+                    sy = int(np.clip(sy, 0, h - 1))
+
+                    k = DEPTH_KERNEL // 2
+                    xs = range(max(0, sx - k), min(w, sx + k + 1))
+                    ys = range(max(0, sy - k), min(h, sy + k + 1))
+                    depth_values = []
+                    for yy in ys:
+                        for xx in xs:
+                            d = depth_frame.get_distance(xx, yy)  # [m]
+                            if d > 0:
+                                depth_values.append(d)
+
+                    if depth_values:
+                        d_med = float(np.median(depth_values))
+                        if dist_smooth is None:
+                            dist_smooth = d_med
+                        else:
+                            # 距離のEMAでさらになめらかに
+                            dist_smooth = 0.7 * dist_smooth + 0.3 * d_med
+                        current_dist = dist_smooth
+
+                        # ★ ここで M5 に距離[m]を送る
+                        send_range_to_drone(current_dist)
             else:
-                det_box = max(candidates, key=lambda b: iou(b, last_detect_box))
-
-    # --- 検出があればトラッカー更新 ---
-    if det_box is not None:
-        last_detect_box = det_box
-        x, y, x2, y2 = det_box.x1, det_box.y1, det_box.x2, det_box.y2
-        w0, h0 = x2 - x, y2 - y
-        tracker = create_tracker()
-        track_ok = tracker.init(frame, (x, y, w0, h0))
-        lost_count = 0
-
-    # --- 検出が無くても追跡継続 ---
-    if tracker is not None:
-        ok, box = tracker.update(frame)
-        track_ok = ok
-        if ok:
-            x, y, w0, h0 = map(int, box)
-            track_box = (x, y, w0, h0)
-            cx, cy = x + w0 // 2, y + h0 // 2
-            smoothed_c = ema(smoothed_c, (cx, cy))
-            trail.append(smoothed_c)
-            frames_since_detect += 1
-        else:
-            lost_count += 1
-            if lost_count > REACQUIRE_MAX_FRAMES:
+                # トラッカー喪失
                 tracker = None
                 track_ok = False
-                frames_since_detect = 0
                 smoothed_c = None
-                trail.clear()
-    else:
-        frames_since_detect = 0
+                dist_smooth = None
 
-    # --- 描画（間引き可） ---
-    if frame_idx % SHOW_EVERY == 0:
+        # --- 最低限の描画（確認用） ---
         vis = frame.copy()
-
-        # 動きマスクプレビュー（右下）
-        small = cv2.resize(motion_mask, (w // 5, h // 5))
-        small_bgr = cv2.cvtColor(small, cv2.COLOR_GRAY2BGR)
-        vis[h - h // 5 - 10 : h - 10, w - w // 5 - 10 : w - 10] = small_bgr
-
-        # ROI可視化
-        if roi_rect is not None:
-            x0, y0, x1, y1 = roi_rect
-            cv2.rectangle(vis, (x0, y0), (x1, y1), (80, 80, 255), 2)
-
-        if track_ok and track_box is not None:
-            x, y, ww, hh = track_box
-            cv2.rectangle(vis, (x, y), (x + ww, y + hh), (0, 255, 0), 2)
-            if smoothed_c:
+        if tracker is not None and track_ok:
+            x, y, w0, h0 = map(int, box)
+            cv2.rectangle(vis, (x, y), (x + w0, y + h0), (0, 255, 0), 2)
+            if smoothed_c is not None:
                 cv2.circle(vis, smoothed_c, 4, (0, 140, 255), -1)
-        elif last_detect_box is not None:
-            b = last_detect_box
-            cv2.rectangle(vis, (b.x1, b.y1), (b.x2, b.y2), (255, 200, 0), 2)
 
-        # 軌跡
-        for i in range(1, len(trail)):
-            cv2.line(vis, trail[i - 1], trail[i], (0, 255, 255), 2)
+        if current_dist is not None:
+            text = f"distance={current_dist:.2f} m"
+            color = (0, 255, 0)
+        else:
+            text = "distance=---"
+            color = (0, 0, 255)
 
         cv2.putText(
             vis,
-            f"track_ok={track_ok}  lost={lost_count}  since_detect={frames_since_detect}",
+            text,
             (10, 30),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.8,
-            (255, 255, 255),
+            0.9,
+            color,
             2,
         )
 
-        cv2.imshow("drone-detect+track+motion", vis)
+        cv2.imshow("drone distance (minimal)", vis)
 
-    frame_idx += 1
-    if cv2.waitKey(1) & 0xFF == 27:  # ESC
-        break
+        frame_idx += 1
+        key = cv2.waitKey(1) & 0xFF
+        if key == 27:  # ESC
+            break
 
-cap.release()
-cv2.destroyAllWindows()
+finally:
+    pipeline.stop()
+    cv2.destroyAllWindows()
